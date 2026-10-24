@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aiden-connector",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // Bundle the brewing guide (skills/aiden-brewing/SKILL.md) as text; the server sends it to Claude as instructions.
+  "rules": [{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }],
+  // OAuth state, and a short-lived cache of the Fellow login token.
+  "kv_namespaces": [{ "binding": "OAUTH_KV","id": "ee24d89d968b433abf548ea86c12044b" }],
+  // Your profile library: coffees, profile versions, tasting notes, equipment.
+  "d1_databases": [{ "binding": "DB", "database_name": "aiden-library","database_id": "493f383b-e301-4261-8b00-36b5d0dc1541" }]
+}
