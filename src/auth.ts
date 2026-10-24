@@ -2,11 +2,23 @@
  * Single-user sign-in for the connector.
  *
  * When Claude connects, the user lands on /authorize, enters the ACCESS_PASSWORD
- * set at deploy time, and approves. The OAuth library handles tokens, PKCE,
- * client registration and consent-forgery protection; this file only renders
- * the page and checks the password.
+ * set at deploy time, and approves. The OAuth library handles tokens, PKCE and
+ * client registration; this file renders the page and checks the password.
+ *
+ * No cookies: some in-app sign-in windows (e.g. the Claude mobile app) don't keep
+ * cookies between opening the page and submitting it. The validated authorization
+ * request is kept server-side in KV under a random, single-use id, and only that
+ * id travels in the form. The password itself is what stops forged approvals, and
+ * the page can't be framed.
  */
-import { AuthorizationError, CimdFetchError, type ConsentDescription, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import {
+  AuthorizationError,
+  CimdFetchError,
+  authorizationErrorRedirect,
+  type AuthRequest,
+  type ConsentDescription,
+  type OAuthHelpers,
+} from "@cloudflare/workers-oauth-provider";
 
 export interface AuthEnv {
   ACCESS_PASSWORD: string;
@@ -16,6 +28,8 @@ export interface AuthEnv {
 
 const MAX_FAILURES_PER_HOUR = 10;
 const MIN_PASSWORD_LENGTH = 12;
+const PENDING_TTL_SECONDS = 15 * 60;
+const pendingKey = (id: string) => `auth:pending:${id}`;
 
 const escape = (v: string) => v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
@@ -40,7 +54,7 @@ export function page(title: string, body: string, status = 200, headers = new He
   );
 }
 
-function consentPage(d: ConsentDescription, handle: string, headers: Headers) {
+function consentPage(d: ConsentDescription, pendingId: string, error?: string) {
   const who = d.clientDomain
     ? `<strong>${escape(d.clientName)}</strong> (published by <strong>${escape(d.clientDomain)}</strong>)`
     : `<strong>${escape(d.clientName)}</strong> <span class="warn">(name not verified)</span>`;
@@ -50,14 +64,15 @@ function consentPage(d: ConsentDescription, handle: string, headers: Headers) {
      <p>${who} wants to manage your brew profiles, coffee library and schedules.</p>
      <p>Access goes to <strong>${escape(d.redirectHost)}</strong>.</p>
      ${d.redirectIsLoopback ? '<p class="warn">This sends access to an app on your own computer. Continue only if you just started connecting from it.</p>' : ""}
+     ${error ? `<p class="warn"><strong>${escape(error)}</strong></p>` : ""}
      <form method="post">
-       <input type="hidden" name="handle" value="${escape(handle)}">
+       <input type="hidden" name="pending" value="${escape(pendingId)}">
        <label for="pw">Connector password</label>
        <input id="pw" type="password" name="password" autocomplete="current-password" autofocus>
        <div class="row"><button name="decision" value="deny">Deny</button><button class="primary" name="decision" value="approve">Allow</button></div>
      </form>`,
-    200,
-    headers,
+    error ? 401 : 200,
+    new Headers({ "Cache-Control": "no-store" }),
   );
 }
 
@@ -78,6 +93,13 @@ async function passwordMatches(given: string, expected: string) {
 const failureKey = (request: Request) =>
   `auth:failures:${request.headers.get("CF-Connecting-IP") ?? "unknown"}:${new Date().toISOString().slice(0, 13)}`;
 
+const expired = () =>
+  page(
+    "Sign-in expired",
+    "<h1>This sign-in page expired</h1><p>Sign-in pages work once and expire after 15 minutes. Start connecting again from Claude.</p>",
+    400,
+  );
+
 export async function handleAuthorize(request: Request, env: AuthEnv): Promise<Response> {
   if (!env.ACCESS_PASSWORD || env.ACCESS_PASSWORD.length < MIN_PASSWORD_LENGTH) {
     return page("Setup needed", `<h1>Setup needed</h1><p>Set an <code>ACCESS_PASSWORD</code> secret of at least ${MIN_PASSWORD_LENGTH} characters on this Worker, then try connecting again.</p>`, 503);
@@ -85,20 +107,24 @@ export async function handleAuthorize(request: Request, env: AuthEnv): Promise<R
   const oauth = env.OAUTH_PROVIDER;
   try {
     if (request.method === "GET") {
-      const authRequest = await oauth.parseAuthRequest(request);
+      const authRequest = await oauth.parseAuthRequest(request); // validates client, redirect URI, PKCE
       const details = await oauth.describeConsent(authRequest);
-      const consent = await oauth.beginConsent(authRequest);
-      return consentPage(details, consent.handle, consent.headers);
+      const pendingId = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      await env.OAUTH_KV.put(pendingKey(pendingId), JSON.stringify(authRequest), { expirationTtl: PENDING_TTL_SECONDS });
+      return consentPage(details, pendingId);
     }
 
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     const form = await request.formData();
-    const handle = String(form.get("handle") ?? "");
+    const pendingId = String(form.get("pending") ?? "");
+    if (!/^[0-9a-f]{64}$/.test(pendingId)) return expired();
+    const stored = await env.OAUTH_KV.get(pendingKey(pendingId));
+    if (!stored) return expired();
+    const authRequest = JSON.parse(stored) as AuthRequest;
 
     if (form.get("decision") !== "approve") {
-      const denied = await oauth.denyConsent(request, handle);
-      denied.headers.set("Location", denied.redirectTo);
-      return new Response(null, { status: 302, headers: denied.headers });
+      await env.OAUTH_KV.delete(pendingKey(pendingId));
+      return Response.redirect(authorizationErrorRedirect(authRequest, "access_denied"), 302);
     }
 
     const key = failureKey(request);
@@ -109,19 +135,18 @@ export async function handleAuthorize(request: Request, env: AuthEnv): Promise<R
     if (!(await passwordMatches(String(form.get("password") ?? ""), env.ACCESS_PASSWORD))) {
       // KV allows ~1 write/sec per key; a dropped increment must not turn into a 500.
       await env.OAUTH_KV.put(key, String(failures + 1), { expirationTtl: 3600 }).catch(() => {});
-      return page("Wrong password", '<h1>Wrong password</h1><p>Go back and try again.</p>', 401);
+      return consentPage(await oauth.describeConsent(authRequest), pendingId, "Wrong password. Try again.");
     }
 
-    const approved = await oauth.approveConsent(request, handle);
+    await env.OAUTH_KV.delete(pendingKey(pendingId)); // single use
     const { redirectTo } = await oauth.completeAuthorization({
-      request: approved.request,
+      request: authRequest,
       userId: "owner",
       metadata: {},
-      scope: approved.request.scope,
+      scope: authRequest.scope,
       props: { user: "owner" },
     });
-    approved.headers.set("Location", redirectTo);
-    return new Response(null, { status: 302, headers: approved.headers });
+    return Response.redirect(redirectTo, 302);
   } catch (error) {
     if (error instanceof AuthorizationError && error.redirectTo) return Response.redirect(error.redirectTo, 302);
     if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
